@@ -122,7 +122,6 @@ class SAM2ImagePredictor:
           with pixel values in [0, 255].
         """
         self.reset_predictor()
-        assert isinstance(image_list, list)
         self._orig_hw = []
         for image in image_list:
             assert isinstance(
