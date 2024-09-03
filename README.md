@@ -1,4 +1,12 @@
-# SAM 2: Segment Anything in Images and Videos
+# SAM 2 for RL
+
+```
+conda activate crossq
+
+pip install -e .
+
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+```
 
 **[AI at Meta, FAIR](https://ai.meta.com/research/)**
 

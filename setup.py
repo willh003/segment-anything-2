@@ -21,6 +21,9 @@ with open("README.md", "r", encoding="utf-8") as f:
     LONG_DESCRIPTION = f.read()
 
 # Required dependencies
+# Commented out so crossq setup isn't overriden
+# The only one I didn't have was iopath
+REQUIRED_PACKAGES=["iopath>=0.1.10"]
 # REQUIRED_PACKAGES = [
 #     "torch>=2.3.1",
 #     "torchvision>=0.18.1",
@@ -31,10 +34,10 @@ with open("README.md", "r", encoding="utf-8") as f:
 #     "pillow>=9.4.0",
 # ]
 
-# EXTRA_PACKAGES = {
-#     "demo": ["matplotlib>=3.9.1", "jupyter>=1.0.0", "opencv-python>=4.7.0"],
-#     "dev": ["black==24.2.0", "usort==1.0.2", "ufmt==2.0.0b2"],
-# }
+EXTRA_PACKAGES = {
+    "demo": ["matplotlib>=3.9.1", "jupyter>=1.0.0", "opencv-python>=4.7.0"],
+    "dev": ["black==24.2.0", "usort==1.0.2", "ufmt==2.0.0b2"],
+}
 
 # By default, we also build the SAM 2 CUDA extension.
 # You may turn off CUDA build with `export SAM2_BUILD_CUDA=0`.

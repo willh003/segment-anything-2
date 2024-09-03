@@ -35,11 +35,17 @@ class SAM2Transforms(nn.Module):
         )
 
     def __call__(self, x):
-        x = self.to_tensor(x)
+        if not type(x) == torch.Tensor:
+            x = self.to_tensor(x)
         return self.transforms(x)
 
     def forward_batch(self, img_list):
-        img_batch = [self.transforms(self.to_tensor(img)) for img in img_list]
+        img_batch = []
+        for img in img_list:
+            if isinstance(img, torch.Tensor):
+                img_batch.append(self.transforms(img))
+            else:
+                img_batch.append(self.transforms(self.to_tensor(img)))
         img_batch = torch.stack(img_batch, dim=0)
         return img_batch
 

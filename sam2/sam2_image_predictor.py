@@ -146,7 +146,7 @@ class SAM2ImagePredictor:
         for image in image_list:
             assert isinstance(
                 image, np.ndarray
-            ), "Images are expected to be an np.ndarray in RGB format, and of shape  HWC"
+            ) or isinstance(image, torch.Tensor), "Images are expected to be an np.ndarray or torch.tensor, with format hwc"
             self._orig_hw.append(image.shape[:2])
         # Transform the image to the form expected by the model
         img_batch = self._transforms.forward_batch(image_list)
@@ -170,6 +170,68 @@ class SAM2ImagePredictor:
         self._is_image_set = True
         self._is_batch = True
         logging.info("Image embeddings computed.")
+
+    def predict_batch_embeddings(
+        self,
+        point_coords_batch: List[np.ndarray] = None,
+        point_labels_batch: List[np.ndarray] = None,
+        box_batch: List[np.ndarray] = None,
+        mask_input_batch: List[np.ndarray] = None,
+        multimask_output: bool = True,
+        return_logits: bool = False,
+        normalize_coords=True,
+    ) -> Tuple[List[torch.Tensor],List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Returns: embeddings, masks, predicted mask ious, and next input sam tokens for the given batch
+        WILL
+        """
+        assert self._is_batch, "This function should only be used when in batched mode"
+        if not self._is_image_set:
+            raise RuntimeError(
+                "An image must be set with .set_image_batch(...) before mask prediction."
+            )
+        num_images = len(self._features["image_embed"])
+        all_embeddings = []
+        all_masks = []
+        all_ious = []
+        all_sam_tokens = []
+        for img_idx in range(num_images):
+            # Transform input prompts
+            point_coords = (
+                point_coords_batch[img_idx] if point_coords_batch is not None else None
+            )
+            point_labels = (
+                point_labels_batch[img_idx] if point_labels_batch is not None else None
+            )
+            box = box_batch[img_idx] if box_batch is not None else None
+            mask_input = (
+                mask_input_batch[img_idx] if mask_input_batch is not None else None
+            )
+            mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
+                point_coords,
+                point_labels,
+                box,
+                mask_input,
+                normalize_coords,
+                img_idx=img_idx,
+            )
+            transformed_embeddings, best_embedding_mask_bool, best_iou_predictions, sam_tokens_out = self._predict(
+                unnorm_coords,
+                labels,
+                unnorm_box,
+                mask_input,
+                multimask_output,
+                return_logits=return_logits,
+                img_idx=img_idx,
+            )
+            
+            all_embeddings.append(transformed_embeddings)
+            all_masks.append(best_embedding_mask_bool)
+            all_ious.append(best_iou_predictions)
+            
+            all_sam_tokens.append(sam_tokens)
+
+        return all_embeddings, all_masks, all_ious, all_sam_tokens
 
     def predict_batch(
         self,
@@ -213,7 +275,7 @@ class SAM2ImagePredictor:
                 normalize_coords,
                 img_idx=img_idx,
             )
-            masks, iou_predictions, low_res_masks = self._predict(
+            masks, iou_predictions, low_res_masks = self._predict_embeddings(
                 unnorm_coords,
                 labels,
                 unnorm_box,
@@ -232,6 +294,8 @@ class SAM2ImagePredictor:
             all_low_res_masks.append(low_res_masks_np)
 
         return all_masks, all_ious, all_low_res_masks
+
+
 
     def predict(
         self,
@@ -331,6 +395,105 @@ class SAM2ImagePredictor:
             if len(mask_input.shape) == 3:
                 mask_input = mask_input[None, :, :, :]
         return mask_input, unnorm_coords, labels, unnorm_box
+
+    @torch.no_grad
+    def _predict_embeddings(
+        self,
+        point_coords: Optional[torch.Tensor],
+        point_labels: Optional[torch.Tensor],
+        boxes: Optional[torch.Tensor] = None,
+        mask_input: Optional[torch.Tensor] = None,
+        multimask_output: bool = True,
+        return_logits: bool = False,
+        img_idx: int = -1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        WILL Implemented
+        Predict masks for the given input prompts, using the currently set image.
+        Input prompts are batched torch tensors and are expected to already be
+        transformed to the input frame using SAM2Transforms.
+
+        Arguments:
+          point_coords (torch.Tensor or None): A BxNx2 array of point prompts to the
+            model. Each point is in (X,Y) in pixels.
+          point_labels (torch.Tensor or None): A BxN array of labels for the
+            point prompts. 1 indicates a foreground point and 0 indicates a
+            background point.
+          boxes (np.ndarray or None): A Bx4 array given a box prompt to the
+            model, in XYXY format.
+          mask_input (np.ndarray): A low resolution mask input to the model, typically
+            coming from a previous prediction iteration. Has form Bx1xHxW, where
+            for SAM, H=W=256. Masks returned by a previous iteration of the
+            predict method do not need further transformation.
+          multimask_output (bool): If true, the model will return three masks.
+            For ambiguous input prompts (such as a single click), this will often
+            produce better masks than a single prediction. If only a single
+            mask is needed, the model's predicted quality score can be used
+            to select the best mask. For non-ambiguous prompts, such as multiple
+            input prompts, multimask_output=False can give better results.
+          return_logits (bool): If true, returns un-thresholded masks logits
+            instead of a binary mask.
+
+        Returns:
+          (torch.Tensor): The output masks in BxCxHxW format, where C is the
+            number of masks, and (H, W) is the original image size.
+          (torch.Tensor): An array of shape BxC containing the model's
+            predictions for the quality of each mask.
+          (torch.Tensor): An array of shape BxCxHxW, where C is the number
+            of masks and H=W=256. These low res logits can be passed to
+            a subsequent iteration as mask input.
+        """
+        if not self._is_image_set:
+            raise RuntimeError(
+                "An image must be set with .set_image(...) before mask prediction."
+            )
+
+        if point_coords is not None:
+            concat_points = (point_coords, point_labels)
+        else:
+            concat_points = None
+
+        # Embed prompts
+        if boxes is not None:
+            box_coords = boxes.reshape(-1, 2, 2)
+            box_labels = torch.tensor([[2, 3]], dtype=torch.int, device=boxes.device)
+            box_labels = box_labels.repeat(boxes.size(0), 1)
+            # we merge "boxes" and "points" into a single "concat_points" input (where
+            # boxes are added at the beginning) to sam_prompt_encoder
+            if concat_points is not None:
+                concat_coords = torch.cat([box_coords, concat_points[0]], dim=1)
+                concat_labels = torch.cat([box_labels, concat_points[1]], dim=1)
+                concat_points = (concat_coords, concat_labels)
+            else:
+                concat_points = (box_coords, box_labels)
+
+        sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
+            points=concat_points,
+            boxes=None,
+            masks=mask_input,
+        )
+
+        # Predict masks
+        batched_mode = (
+            concat_points is not None and concat_points[0].shape[0] > 1
+        )  # multi object prediction
+        high_res_features = [
+            feat_level[img_idx].unsqueeze(0)
+            for feat_level in self._features["high_res_feats"]
+        ]
+        transformed_embeddings, best_embedding_mask, best_iou_predictions, sam_tokens_out, _ = self.model.sam_mask_decoder.forward_embeddings(
+            image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
+            image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=multimask_output,
+            repeat_image=batched_mode,
+            high_res_features=high_res_features,
+        )
+
+        best_embedding_mask_bool = best_embedding_mask > self.mask_threshold
+
+        return transformed_embeddings, best_embedding_mask_bool, best_iou_predictions, sam_tokens_out
 
     @torch.no_grad()
     def _predict(
