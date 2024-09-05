@@ -92,8 +92,7 @@ class SAM2ImagePredictor:
         masks to be predicted with the 'predict' method.
 
         Arguments:
-          image (np.ndarray or PIL Image): The input image to embed in RGB format. The image should be in HWC format if np.ndarray, or WHC format if PIL Image
-          with pixel values in [0, 255].
+          image (np.ndarray or torch.Tensor or PIL Image): The input image to embed in RGB format. The image should be in HWC format if np.ndarray, or WHC format if PIL Image or torch.tensor with pixel values in [0, 1].
           image_format (str): The color format of the image, in ['RGB', 'BGR'].
         """
         self.reset_predictor()
@@ -101,15 +100,16 @@ class SAM2ImagePredictor:
         if isinstance(image, np.ndarray):
             logging.info("For numpy array image, we assume (HxWxC) format")
             self._orig_hw = [image.shape[:2]]
+        elif isinstance(image, torch.Tensor):
+            self._orig_hw = [image.shape[1:]]
         elif isinstance(image, Image):
             w, h = image.size
             self._orig_hw = [(h, w)]
         else:
             raise NotImplementedError("Image format not supported")
-
         input_image = self._transforms(image)
         input_image = input_image[None, ...].to(self.device)
-
+        
         assert (
             len(input_image.shape) == 4 and input_image.shape[1] == 3
         ), f"input_image must be of size 1x3xHxW, got {input_image.shape}"
@@ -138,8 +138,8 @@ class SAM2ImagePredictor:
         masks to be predicted with the 'predict_batch' method.
 
         Arguments:
-          image_list (List[np.ndarray]): The input images to embed in RGB format. The image should be in HWC format if np.ndarray
-          with pixel values in [0, 255].
+          image_list (List[np.ndarray] ): The input images to embed in RGB format. The image should be in HWC format if np.ndarray
+          with pixel values in [0, 1].
         """
         self.reset_predictor()
         self._orig_hw = []
@@ -170,7 +170,7 @@ class SAM2ImagePredictor:
         self._is_image_set = True
         self._is_batch = True
         logging.info("Image embeddings computed.")
-
+    
     def predict_batch_embeddings(
         self,
         point_coords_batch: List[np.ndarray] = None,
@@ -215,23 +215,28 @@ class SAM2ImagePredictor:
                 normalize_coords,
                 img_idx=img_idx,
             )
-            transformed_embeddings, best_embedding_mask_bool, best_iou_predictions, sam_tokens_out = self._predict(
+
+            sparse_prompt_embeddings, dense_prompt_embeddings, multi_object_mode = self._encode_prompts(
                 unnorm_coords,
                 labels,
                 unnorm_box,
-                mask_input,
+                mask_input)
+
+            transformed_embeddings, best_embedding_mask, best_iou_predictions, sam_tokens_out = self.predict_embeddings(
+                sparse_prompt_embeddings,
+                dense_prompt_embeddings,
+                multi_object_mode,
                 multimask_output,
                 return_logits=return_logits,
                 img_idx=img_idx,
             )
             
-            all_embeddings.append(transformed_embeddings)
-            all_masks.append(best_embedding_mask_bool)
-            all_ious.append(best_iou_predictions)
-            
-            all_sam_tokens.append(sam_tokens)
-
-        return all_embeddings, all_masks, all_ious, all_sam_tokens
+            # squeeze because running on 1 image at a time, so batch dim of _predict will be 1
+            all_embeddings.append(transformed_embeddings.squeeze(0))
+            all_masks.append(best_embedding_mask.squeeze(0))
+            all_ious.append(best_iou_predictions.squeeze(0))
+            all_sam_tokens.append(sam_tokens_out.squeeze(0))
+        return torch.stack(all_embeddings), torch.stack(all_masks), torch.stack(all_ious), torch.stack(all_sam_tokens)
 
     def predict_batch(
         self,
@@ -275,7 +280,7 @@ class SAM2ImagePredictor:
                 normalize_coords,
                 img_idx=img_idx,
             )
-            masks, iou_predictions, low_res_masks = self._predict_embeddings(
+            masks, iou_predictions, low_res_masks = self._predict(
                 unnorm_coords,
                 labels,
                 unnorm_box,
@@ -396,23 +401,17 @@ class SAM2ImagePredictor:
                 mask_input = mask_input[None, :, :, :]
         return mask_input, unnorm_coords, labels, unnorm_box
 
-    @torch.no_grad
-    def _predict_embeddings(
+    def _encode_prompts(
         self,
         point_coords: Optional[torch.Tensor],
         point_labels: Optional[torch.Tensor],
         boxes: Optional[torch.Tensor] = None,
         mask_input: Optional[torch.Tensor] = None,
-        multimask_output: bool = True,
-        return_logits: bool = False,
-        img_idx: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         """
-        WILL Implemented
-        Predict masks for the given input prompts, using the currently set image.
-        Input prompts are batched torch tensors and are expected to already be
-        transformed to the input frame using SAM2Transforms.
-
+        WILL
+        Encode a set of prompts into sparse and dense prompt embeddings
+        
         Arguments:
           point_coords (torch.Tensor or None): A BxNx2 array of point prompts to the
             model. Each point is in (X,Y) in pixels.
@@ -425,29 +424,11 @@ class SAM2ImagePredictor:
             coming from a previous prediction iteration. Has form Bx1xHxW, where
             for SAM, H=W=256. Masks returned by a previous iteration of the
             predict method do not need further transformation.
-          multimask_output (bool): If true, the model will return three masks.
-            For ambiguous input prompts (such as a single click), this will often
-            produce better masks than a single prediction. If only a single
-            mask is needed, the model's predicted quality score can be used
-            to select the best mask. For non-ambiguous prompts, such as multiple
-            input prompts, multimask_output=False can give better results.
-          return_logits (bool): If true, returns un-thresholded masks logits
-            instead of a binary mask.
-
         Returns:
-          (torch.Tensor): The output masks in BxCxHxW format, where C is the
-            number of masks, and (H, W) is the original image size.
-          (torch.Tensor): An array of shape BxC containing the model's
-            predictions for the quality of each mask.
-          (torch.Tensor): An array of shape BxCxHxW, where C is the number
-            of masks and H=W=256. These low res logits can be passed to
-            a subsequent iteration as mask input.
+            sparse_embeddings: corresponding to points/boxes
+            dense_embeddings: corresponding to masks
+            multi_object_mode: whether multiple points were selected (and thus whether to perform multi object prediction)
         """
-        if not self._is_image_set:
-            raise RuntimeError(
-                "An image must be set with .set_image(...) before mask prediction."
-            )
-
         if point_coords is not None:
             concat_points = (point_coords, point_labels)
         else:
@@ -473,27 +454,110 @@ class SAM2ImagePredictor:
             masks=mask_input,
         )
 
-        # Predict masks
-        batched_mode = (
+        multi_object_mode = (
             concat_points is not None and concat_points[0].shape[0] > 1
         )  # multi object prediction
+        
+        return sparse_embeddings, dense_embeddings, multi_object_mode
+
+    @torch.no_grad
+    def predict_embeddings(
+        self,
+        sparse_prompt_embeddings: [torch.Tensor],
+        dense_prompt_embeddings: [torch.Tensor],
+        multi_object_mode: bool = False,
+        multimask_output: bool = True,
+        return_logits: bool = False,
+        img_idx: int = -1,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        WILL Implemented
+        Predict masks for the given input prompts, using the currently set image.
+        Input prompts are batched torch tensors and are expected to already be
+        transformed to the input frame using SAM2Transforms.
+
+        Arguments:
+          sparse_prompt_embeddings (torch.Tensor): the sparse embeddings obtained from self.encode_prompts()
+          dense_prompt_embeddings (torch.Tensor): the dense embeddings obtained from self.encode_prompts()
+          multi_object_mode (bool): If true, then the prompts represent multiple objects, so the model will do batched inference
+          multimask_output (bool): If true, the model will return three masks.
+            For ambiguous input prompts (such as a single click), this will often
+            produce better masks than a single prediction. If only a single
+            mask is needed, the model's predicted quality score can be used
+            to select the best mask. For non-ambiguous prompts, such as multiple
+            input prompts, multimask_output=False can give better results.
+          return_logits (bool): If true, returns un-thresholded masks logits
+            instead of a binary mask.
+
+        Returns:
+          (torch.Tensor): the embeddings after applying the transformer, with shape BxCxHxW
+          (torch.Tensor): The best output mask logits, with shape BxHxW. This can be used as input for computing prompt embeddings.
+          (torch.Tensor): An array of shape B containing the model's predictions of mask quality predictions for the best mask
+          (torch.Tensor): the tokens used for converting the embeddings to masks, for each mask that was computed (shape B x n_masks x D)
+        """
+        if not self._is_image_set:
+            raise RuntimeError(
+                "An image must be set with .set_image(...) before mask prediction."
+            )
+
         high_res_features = [
             feat_level[img_idx].unsqueeze(0)
             for feat_level in self._features["high_res_feats"]
         ]
+
         transformed_embeddings, best_embedding_mask, best_iou_predictions, sam_tokens_out, _ = self.model.sam_mask_decoder.forward_embeddings(
             image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
             image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
+            sparse_prompt_embeddings=sparse_prompt_embeddings,
+            dense_prompt_embeddings=dense_prompt_embeddings,
             multimask_output=multimask_output,
-            repeat_image=batched_mode,
+            repeat_image=multi_object_mode,
             high_res_features=high_res_features,
         )
 
-        best_embedding_mask_bool = best_embedding_mask > self.mask_threshold
 
-        return transformed_embeddings, best_embedding_mask_bool, best_iou_predictions, sam_tokens_out
+        # clamp the mask for numerical stability on future runs (when it is a prompt)
+        best_embedding_mask = torch.clamp(best_embedding_mask, -32.0, 32.0)
+
+        return transformed_embeddings, best_embedding_mask, best_iou_predictions, sam_tokens_out
+
+    def get_point_embeddings(
+        self, point_coords, point_labels, normalize_coords=True, img_idx=-1):
+        """
+        Get the sparse and dense embeddings corresponding to a set of point prompts, for later use with predict_embeddings
+        """
+        mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        box=None,
+        mask_logits=None,
+        normalize_coords=normalize_coords,
+        img_idx=img_idx)
+
+        sparse_prompt_embeddings, dense_prompt_embeddings, multi_object_mode = self._encode_prompts(
+            unnorm_coords,
+            labels,
+            unnorm_box,
+            mask_input)
+
+        return sparse_prompt_embeddings, dense_prompt_embeddings, multi_object_mode
+
+    def get_mask_embeddings(self, mask):
+        """
+        Get the sparse and dense prompt embeddings given a mask output by an earlier iteration of the model
+        """
+
+        mask_input, unnorm_coords, labels, unnorm_box = self._prep_prompts(
+                                                                point_coords=None,
+                                                                point_labels=None,
+                                                                box=None,
+                                                                mask_logits=mask,
+                                                                normalize_coords=True)
+
+        return self._encode_prompts(unnorm_coords,
+                                        labels,
+                                        unnorm_box,
+                                        mask_input)
 
     @torch.no_grad()
     def _predict(
@@ -575,6 +639,7 @@ class SAM2ImagePredictor:
         batched_mode = (
             concat_points is not None and concat_points[0].shape[0] > 1
         )  # multi object prediction
+
         high_res_features = [
             feat_level[img_idx].unsqueeze(0)
             for feat_level in self._features["high_res_feats"]

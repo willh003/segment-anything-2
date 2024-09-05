@@ -25,5 +25,3 @@ image_2 = np.asarray(Image.open("/share/portal/wph52/CrossQ/debugging/images/muj
 
 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
     predictor.set_image_batch([image_1, image_2])
-
-    breakpoint()

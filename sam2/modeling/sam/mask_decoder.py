@@ -277,7 +277,8 @@ class MaskDecoder(nn.Module):
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
-            high_res_features=high_res_features,
+            multimask_output=multimask_output,
+            high_res_features=high_res_features, 
         )
 
         if multimask_output and self.use_multimask_token_for_obj_ptr:
@@ -299,6 +300,7 @@ class MaskDecoder(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
+        multimask_output: bool,
         high_res_features: Optional[List[torch.Tensor]] = None):
         """
         IMPORTANT: Will's implementation of predict masks, for extracting embeddings
@@ -371,12 +373,17 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        mask_threshold = 0 # TODO: take this as argument from image_predictor (caller of this function)
-
-        best_masks_indices = torch.argmax(iou_pred, dim=1) # shape(b), in range [0, n_masks)
-        best_iou_pred = torch.max(iou_pred, dim=1) # shape(b), in range [0, n_masks)
-        best_masks_logits = masks[torch.arange(b), best_masks_indices] # from shape (b, n_masks, h, w) -> (b, h, w)
-        
+        if multimask_output:
+            # Multimask output takes the last 3 masks (the first channel is values for single mask output)
+            iou_pred = iou_pred[:, 1:]
+            masks = masks[:, 1:, :, :]
+            
+            best_iou_pred, best_masks_indices = torch.max(iou_pred, dim=1) # shape(b), in range [0, n_masks), where n_masks is usually 3
+            best_masks = masks[torch.arange(b), best_masks_indices] # from shape (b, n_masks, h, w) -> (b, h, w)
+        # Note: got rid of dynamic multimask stability here, to avoid overcomplication
+        else:
+            best_masks = masks[:, 0, :, :]
+            best_iou_pred = iou_pred[:, 0]
         return upscaled_embedding, best_masks, best_iou_pred, mask_tokens_out, object_score_logits
 
     def _get_stability_scores(self, mask_logits):

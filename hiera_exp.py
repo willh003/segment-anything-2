@@ -84,7 +84,6 @@ def experiment_2():
     model.set_target_embedding(target)
     rewards, all_labels = rewards_from_gifs(model, smooth_transform, gif_paths) 
 
-    breakpoint() 
     rewards_matrix_heatmap(rewards, 'hiera.png')
 
 
